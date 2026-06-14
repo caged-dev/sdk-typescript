@@ -141,3 +141,120 @@ export interface Port {
   state: string;
   url?: string;
 }
+
+// --- Logs ---
+
+export interface LogEntry {
+  timestamp: string;
+  type: string;
+  message: string;
+}
+
+// --- Agent Sessions ---
+
+export interface AgentSession {
+  id: string;
+  sandbox_id: string;
+  status: "active" | "completed" | "failed";
+  agent_type?: string;
+  model?: string;
+  tokens_in: number;
+  tokens_out: number;
+  cost_usd: number;
+  trust_score?: number;
+  event_count: number;
+  duration_ms?: number;
+  started_at: string;
+  ended_at?: string;
+}
+
+// --- Replay ---
+
+export interface ReplayEvent {
+  id: string;
+  session_id: string;
+  type: string;
+  timestamp: string;
+  data: Record<string, unknown>;
+}
+
+export interface ReplaySummary {
+  session_id: string;
+  total_events: number;
+  duration_ms: number;
+  tokens_in: number;
+  tokens_out: number;
+  cost_usd: number;
+  trust_score?: number;
+  tools_used: string[];
+  files_modified: string[];
+}
+
+// --- Events ---
+
+export interface EventPayload {
+  id?: string;
+  type: string;
+  sandbox_id: string;
+  session_id?: string;
+  timestamp?: string;
+  data: Record<string, unknown>;
+}
+
+export interface IngestResponse {
+  accepted: number;
+  errors: number;
+}
+
+// --- Alerts ---
+
+export interface Alert {
+  id: string;
+  type: string;
+  severity: "low" | "medium" | "high" | "critical";
+  message: string;
+  sandbox_id?: string;
+  resolved: boolean;
+  resolved_at?: string;
+  created_at: string;
+}
+
+export interface AlertRule {
+  id: string;
+  type: string;
+  enabled: boolean;
+  threshold?: number;
+  cooldown_minutes?: number;
+  channels: string[];
+}
+
+// --- Notifications ---
+
+export interface Notification {
+  id: string;
+  type: string;
+  title: string;
+  body: string;
+  read: boolean;
+  alert_id?: string;
+  created_at: string;
+}
+
+export interface NotificationConfig {
+  email_enabled: boolean;
+  slack_enabled: boolean;
+  slack_webhook_url?: string;
+  discord_enabled: boolean;
+  discord_webhook_url?: string;
+  channels: Record<string, boolean>;
+}
+
+// --- Billing ---
+
+export interface Subscription {
+  plan: string;
+  status: "active" | "trialing" | "canceled" | "past_due" | "none";
+  current_period_end?: string;
+  cancel_at_period_end?: boolean;
+  trial_end?: string;
+}

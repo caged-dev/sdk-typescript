@@ -1,6 +1,6 @@
 {
   "name": "@caged-dev/sdk",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Official TypeScript SDK for the Caged AI Agent Sandbox Platform",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
