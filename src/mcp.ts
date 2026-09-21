@@ -15,65 +15,76 @@
  * mcp.close();
  * ```
  */
+import { CagedError } from "./errors";
+import type { WebSocketLike } from "./types";
+import { VERSION } from "./version";
+
+/** Error returned by the MCP server, as a JSON-RPC error object. */
+export class MCPError extends CagedError {
+  public readonly code: number;
+
+  constructor(code: number, message: string) {
+    super(`MCP error ${code}: ${message}`);
+    this.name = "MCPError";
+    this.code = code;
+  }
+}
+
+interface Pending {
+  resolve: (value: unknown) => void;
+  reject: (reason: Error) => void;
+}
+
 export class MCPClient {
-  private ws: WebSocket;
-  private _closed = false;
+  private readonly ws: WebSocketLike;
+  private readonly pending = new Map<number, Pending>();
+  private readonly notificationHandlers: ((
+    method: string,
+    params: unknown
+  ) => void)[] = [];
+  private readonly closeHandlers: (() => void)[] = [];
+  private isClosed = false;
   private requestId = 0;
-  private pending = new Map<
-    number,
-    { resolve: (value: any) => void; reject: (reason: any) => void }
-  >();
-  private notificationHandlers: ((method: string, params: any) => void)[] = [];
-  private closeHandlers: (() => void)[] = [];
 
   /** @internal */
-  constructor(ws: WebSocket) {
+  constructor(ws: WebSocketLike) {
     this.ws = ws;
     this.ws.addEventListener("message", (event) => {
+      const data = event.data;
+      if (data === undefined || data === null) return;
+      let parsed: unknown;
       try {
-        const msg = JSON.parse(String(event.data));
-        if (msg.id != null && this.pending.has(msg.id)) {
-          const { resolve, reject } = this.pending.get(msg.id)!;
-          this.pending.delete(msg.id);
-          if (msg.error) {
-            reject(new MCPError(msg.error.code, msg.error.message));
-          } else {
-            resolve(msg.result);
-          }
-        } else if (!msg.id && msg.method) {
-          // Notification from server.
-          for (const handler of this.notificationHandlers) {
-            handler(msg.method, msg.params);
-          }
-        }
+        parsed = JSON.parse(String(data));
       } catch {
-        // Ignore malformed messages.
+        return; // Malformed frame.
       }
+      if (typeof parsed !== "object" || parsed === null) return;
+      this.dispatch(parsed as Record<string, unknown>);
     });
     this.ws.addEventListener("close", () => {
-      this._closed = true;
-      // Reject all pending requests.
-      for (const [, { reject }] of this.pending) {
-        reject(new Error("MCP connection closed"));
-      }
-      this.pending.clear();
+      this.isClosed = true;
+      this.failPending(new MCPError(-1, "MCP connection closed"));
       for (const handler of this.closeHandlers) handler();
     });
   }
 
-  /** Initialize the MCP session. Called automatically on connect. */
+  /** Initialize the MCP session. Called for you by `caged.sandboxes.mcp()`. */
   async initialize(): Promise<MCPInitializeResult> {
-    return this.request("initialize", {
+    const result = await this.request("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
-      clientInfo: { name: "@caged-dev/sdk", version: "0.2.0" },
+      // Read from the package version rather than written out again: a
+      // hardcoded version here is how the published 0.2.0 came to announce
+      // itself as 0.1.0.
+      clientInfo: { name: "@caged-dev/sdk", version: VERSION },
     });
+    return (result ?? {}) as MCPInitializeResult;
   }
 
   /** List available tools in the sandbox. */
   async listTools(): Promise<MCPTool[]> {
     const result = await this.request("tools/list", {});
-    return result.tools;
+    return listField<MCPTool>(result, "tools");
   }
 
   /** Call a tool by name with arguments. */
@@ -81,24 +92,26 @@ export class MCPClient {
     name: string,
     args: Record<string, unknown> = {}
   ): Promise<MCPToolResult> {
-    return this.request("tools/call", { name, arguments: args });
+    const result = await this.request("tools/call", { name, arguments: args });
+    return (result ?? {}) as MCPToolResult;
   }
 
   /** List available resources. */
   async listResources(): Promise<MCPResource[]> {
     const result = await this.request("resources/list", {});
-    return result.resources;
+    return listField<MCPResource>(result, "resources");
   }
 
   /** Read a resource by URI. */
   async readResource(uri: string): Promise<MCPResourceContent> {
-    return this.request("resources/read", { uri });
+    const result = await this.request("resources/read", { uri });
+    return (result ?? {}) as MCPResourceContent;
   }
 
   /** List available prompts. */
   async listPrompts(): Promise<MCPPrompt[]> {
     const result = await this.request("prompts/list", {});
-    return result.prompts;
+    return listField<MCPPrompt>(result, "prompts");
   }
 
   /** Get a prompt with arguments. */
@@ -106,7 +119,11 @@ export class MCPClient {
     name: string,
     args: Record<string, string> = {}
   ): Promise<MCPPromptResult> {
-    return this.request("prompts/get", { name, arguments: args });
+    const result = await this.request("prompts/get", {
+      name,
+      arguments: args,
+    });
+    return (result ?? {}) as MCPPromptResult;
   }
 
   /** Ping the server. */
@@ -114,8 +131,8 @@ export class MCPClient {
     await this.request("ping", {});
   }
 
-  /** Listen for server notifications (e.g., streaming output). */
-  onNotification(handler: (method: string, params: any) => void): void {
+  /** Listen for server notifications (e.g. streaming output). */
+  onNotification(handler: (method: string, params: unknown) => void): void {
     this.notificationHandlers.push(handler);
   }
 
@@ -126,41 +143,76 @@ export class MCPClient {
 
   /** Whether the connection is closed. */
   get closed(): boolean {
-    return this._closed;
+    return this.isClosed;
   }
 
   /** Close the MCP connection. */
   close(): void {
-    if (!this._closed) {
-      this._closed = true;
-      this.ws.close();
+    if (this.isClosed) return;
+    this.isClosed = true;
+    this.failPending(new MCPError(-1, "MCP connection closed"));
+    this.ws.close();
+  }
+
+  private dispatch(msg: Record<string, unknown>): void {
+    const id = msg.id;
+    if (typeof id === "number") {
+      const pending = this.pending.get(id);
+      if (!pending) return;
+      this.pending.delete(id);
+      const error = msg.error;
+      if (typeof error === "object" && error !== null) {
+        const { code, message } = error as {
+          code?: unknown;
+          message?: unknown;
+        };
+        pending.reject(
+          new MCPError(
+            typeof code === "number" ? code : -1,
+            typeof message === "string" ? message : "unknown MCP error"
+          )
+        );
+        return;
+      }
+      pending.resolve(msg.result);
+      return;
+    }
+    if (typeof msg.method === "string") {
+      for (const handler of this.notificationHandlers) {
+        handler(msg.method, msg.params);
+      }
     }
   }
 
-  private request(method: string, params: unknown): Promise<any> {
-    if (this._closed) {
-      return Promise.reject(new Error("MCP connection closed"));
-    }
+  private failPending(err: Error): void {
+    for (const [, pending] of this.pending) pending.reject(err);
+    this.pending.clear();
+  }
 
+  private request(method: string, params: unknown): Promise<unknown> {
+    if (this.isClosed) {
+      return Promise.reject(new MCPError(-1, "MCP connection closed"));
+    }
     const id = ++this.requestId;
-    return new Promise((resolve, reject) => {
+    return new Promise<unknown>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
-      this.ws.send(
-        JSON.stringify({ jsonrpc: "2.0", id, method, params })
-      );
+      this.ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
     });
   }
 }
 
-/** Error from the MCP server. */
-export class MCPError extends Error {
-  public readonly code: number;
-
-  constructor(code: number, message: string) {
-    super(message);
-    this.name = "MCPError";
-    this.code = code;
-  }
+/**
+ * Read an array out of a JSON-RPC result.
+ *
+ * Absent or non-array means an empty list rather than a crash: `listTools()`
+ * used to return `result.tools` unchecked, so a server that answered `{}`
+ * handed the caller `undefined` typed as `MCPTool[]`, and the `.map` after
+ * the call threw.
+ */
+function listField<T>(result: unknown, key: string): T[] {
+  if (typeof result !== "object" || result === null) return [];
+  const value = (result as Record<string, unknown>)[key];
+  return Array.isArray(value) ? (value as T[]) : [];
 }
 
 // --- MCP Types ---
