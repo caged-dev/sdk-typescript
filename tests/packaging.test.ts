@@ -68,3 +68,24 @@ describe("workflows", () => {
     expect(publish).toContain("verify-tarball");
   });
 });
+
+describe("deprecated type aliases stay importable", () => {
+  it("keeps Session and TrustScore resolvable", () => {
+    // Type-only assertion: removing an exported type breaks a consumer's
+    // build, so the old names alias the new ones until 0.5.0.
+    const session: import("../src/types").Session = {
+      id: "s",
+      user_agent: "ua",
+      ip: "1.2.3.4",
+      expires_at: "t",
+      created_at: "t",
+    };
+    const score: import("../src/types").TrustScore = {
+      session_id: "s",
+      score: 90,
+      updated_at: "t",
+    };
+    expect(session.ip).toBe("1.2.3.4");
+    expect(score.score).toBe(90);
+  });
+});

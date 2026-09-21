@@ -632,3 +632,21 @@ export interface SocketTicket {
   expires_in: number;
   expires_at: string;
 }
+
+// ---------------------------------------------------------------------------
+// Deprecated aliases
+// ---------------------------------------------------------------------------
+
+/**
+ * @deprecated Renamed to {@link AccountSession} in 0.3.0, and its fields
+ * corrected: the API emits `ip` and `expires_at`, never `ip_address` or
+ * `last_active_at`. Removed no earlier than 0.5.0.
+ */
+export type Session = AccountSession;
+
+/**
+ * @deprecated Renamed to {@link TrustScoreSummary} in 0.3.0, and its fields
+ * corrected: the listing returns `{session_id, score, updated_at}` only.
+ * Removed no earlier than 0.5.0.
+ */
+export type TrustScore = TrustScoreSummary;
