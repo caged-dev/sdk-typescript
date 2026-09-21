@@ -1,6 +1,6 @@
 {
   "name": "@caged-dev/sdk",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Official TypeScript SDK for the Caged AI Agent Sandbox Platform",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -11,27 +11,43 @@
       "require": "./dist/index.js"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist",
+    "CHANGELOG.md"
+  ],
   "scripts": {
     "build": "tsup src/index.ts --format cjs,esm --dts",
     "dev": "tsup src/index.ts --format cjs,esm --dts --watch",
     "lint": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "verify-tarball": "node scripts/verify-tarball.mjs"
   },
-  "keywords": ["caged", "sandbox", "ai", "agent", "firecracker", "microvm"],
+  "keywords": [
+    "caged",
+    "sandbox",
+    "ai",
+    "agent",
+    "firecracker",
+    "microvm"
+  ],
   "author": "Bytangle Ltd",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/caged-dev/sdk-typescript"
   },
-  "homepage": "https://docs.caged.dev/sdks/typescript",
+  "homepage": "https://caged.dev/docs/sdks/typescript",
   "bugs": {
     "url": "https://github.com/caged-dev/sdk-typescript/issues"
   },
   "devDependencies": {
+    "@types/node": "^22.20.4",
     "tsup": "^8.0.0",
     "typescript": "^5.5.0",
     "vitest": "^2.0.0"
-  }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false
 }

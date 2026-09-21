@@ -1,6 +1,11 @@
 # @caged-dev/sdk
 
-Official TypeScript SDK for the [Caged](https://caged.dev) AI Agent Sandbox Platform.
+Official TypeScript SDK for the [Caged](https://caged.dev) AI Agent Sandbox
+Platform. A thin, typed wrapper over the Caged REST API — no client-side
+business logic, no hidden state, one HTTP call per method.
+
+Node.js 18+ (native `fetch`). No runtime dependencies. ESM and CJS, with
+type declarations for both.
 
 ## Installation
 
@@ -10,25 +15,34 @@ npm install @caged-dev/sdk
 pnpm add @caged-dev/sdk
 ```
 
+> **0.3.0 repairs calls that failed for every user of 0.1.0 and 0.2.0.**
+> `files.write`, `snapshots.restore`, `billing.createCheckout`,
+> `notifications.unreadCount` and the alert, notification and replay listings
+> could not succeed against the live API. 0.2.0 was a repackage of 0.1.0. See
+> [CHANGELOG.md](CHANGELOG.md).
+
 ## Quick Start
 
 ```typescript
 import { Caged } from "@caged-dev/sdk";
 
-const caged = new Caged({ apiKey: "caged_sk_..." });
+const caged = new Caged({ apiKey: process.env.CAGED_API_KEY! });
 
-// Create a sandbox with Claude Code installed
+// Create a sandbox with Claude Code installed. `template` is required.
 const sandbox = await caged.sandboxes.create({
   template: "node-20",
   agents: ["claude-code"],
-  env: { ANTHROPIC_API_KEY: "sk-ant-..." },
+  env: { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY! },
 });
 
-// Run a command
+// Run a command. A non-zero exit code is a result, not an exception.
 const result = await caged.sandboxes.exec(sandbox.id, "echo hello");
-console.log(result.output); // "hello"
+console.log(result.output, result.exit_code);
 
-// Clean up
+// Write and read files
+await caged.files.write(sandbox.id, "/workspace/hello.js", "console.log(1)");
+const content = await caged.files.read(sandbox.id, "/workspace/hello.js");
+
 await caged.sandboxes.destroy(sandbox.id);
 ```
 
@@ -39,309 +53,298 @@ const caged = new Caged({
   apiKey: "caged_sk_...",              // Required
   baseUrl: "https://api.caged.dev",    // Optional (default)
   timeout: 30000,                      // Optional: request timeout in ms
+  fetch: myFetch,                      // Optional: inject a fetch
+  webSocket: (url, protocols) => ...,  // Optional: inject a WebSocket
 });
 ```
 
----
+Every request is bounded by a timeout. `sandboxes.create` and
+`sandboxes.exec` use longer defaults (360s and 300s) because a create can
+clone a repo and install agents, and an exec can be a long-running agent
+prompt; `exec` takes a per-call timeout.
+
+`webSocket` is only needed for the terminal, streaming exec and MCP clients.
+It defaults to the global `WebSocket`, which browsers have and Node.js has
+only from 22. On Node 18 or 20:
+
+```typescript
+import WebSocket from "ws";
+
+const caged = new Caged({
+  apiKey: process.env.CAGED_API_KEY!,
+  webSocket: (url, protocols) => new WebSocket(url, protocols) as never,
+});
+```
+
+## Templates
+
+`minimal`, `node-22`, `node-20`, `python-312`, `python-311`, `desktop`. The
+aliases `node`, `python`, `gui` and `computer` also resolve. An unknown
+template is a 400 that names the valid set.
+
+## Field naming
+
+Response types carry the API's own JSON keys — `memory_mb`, `exit_code`,
+`preview_url`, `mod_time` — rather than camel-cased equivalents. The SDK is a
+thin wrapper and does not rename the wire.
 
 ## Sandboxes
 
-### Create & Manage
-
 ```typescript
-// Create with full options
-const sandbox = await caged.sandboxes.create({
-  template: "python-312",
-  cpus: 4,
-  memory_mb: 2048,
-  disk_gb: 10,
-  network_mode: "allowlist",
-  allowlist: ["*.github.com", "api.openai.com"],
-  env: { API_KEY: "secret" },
-  repo: "https://github.com/user/project",
-  agents: ["claude-code", "aider"],
-  budget: 5.0,
-  timeout: 1800,
-});
-
-// List, get, pause, resume, destroy
 const sandboxes = await caged.sandboxes.list();
-const sb = await caged.sandboxes.get(sandbox.id);
+const sandbox = await caged.sandboxes.get("sbx_1");
+
 await caged.sandboxes.pause(sandbox.id);
 await caged.sandboxes.resume(sandbox.id);
+
+// Lifecycle log lines, and the ports the guest opened
+const logs = await caged.sandboxes.logs(sandbox.id, 100);
+for (const port of await caged.sandboxes.ports(sandbox.id)) {
+  console.log(port.port, port.preview_url);
+}
+
+// Trust scores, one row per agent session run in this sandbox
+const scores = await caged.sandboxes.trustScores(sandbox.id);
+
 await caged.sandboxes.destroy(sandbox.id);
 ```
 
-### Execute Commands
-
-```typescript
-// Simple exec (returns when complete)
-const result = await caged.sandboxes.exec(sandbox.id, "npm test");
-console.log(result.output);
-console.log(result.exit_code);
-
-// Streaming exec (real-time output)
-const stream = caged.sandboxes.execStream(sandbox.id, "npm run build");
-for await (const chunk of stream) {
-  process.stdout.write(chunk);
-}
-console.log("Exit:", stream.exitCode);
-
-// Or collect all output at once
-const output = await stream.text();
-```
-
-### Interactive Terminal (WebSocket)
-
-```typescript
-const terminal = await caged.sandboxes.terminal(sandbox.id, {
-  rows: 40,
-  cols: 120,
-});
-
-terminal.onOutput((data) => process.stdout.write(data));
-terminal.onClose(() => console.log("Terminal closed"));
-
-// Send commands
-terminal.send("cd /workspace && ls\n");
-terminal.send("claude -p 'refactor the auth module'\n");
-
-// Resize
-terminal.resize(50, 160);
-
-// Close when done
-terminal.close();
-```
-
-### MCP Connection (AI Agent Tools)
-
-Connect via Model Context Protocol to call sandbox tools programmatically:
-
-```typescript
-const mcp = await caged.sandboxes.mcp(sandbox.id);
-
-// List available tools
-const tools = await mcp.listTools();
-// → filesystem_read, filesystem_write, terminal_exec, git_status, ...
-
-// Read a file
-const file = await mcp.callTool("filesystem_read", { path: "src/index.ts" });
-console.log(file.content[0].text);
-
-// Execute a command
-const result = await mcp.callTool("terminal_exec", {
-  command: "npm test",
-  timeout_ms: 60000,
-});
-
-// Write a file
-await mcp.callTool("filesystem_write", {
-  path: "src/new-file.ts",
-  content: 'export const hello = "world";',
-});
-
-// List resources and prompts
-const resources = await mcp.listResources();
-const prompts = await mcp.listPrompts();
-
-// Listen for server notifications
-mcp.onNotification((method, params) => {
-  console.log("Notification:", method, params);
-});
-
-mcp.close();
-```
-
-### Logs & Ports
-
-```typescript
-// Get sandbox logs
-const logs = await caged.sandboxes.logs(sandbox.id, 50);
-for (const log of logs) {
-  console.log(`[${log.timestamp}] ${log.type}: ${log.message}`);
-}
-
-// List open ports
-const ports = await caged.sandboxes.ports(sandbox.id);
-// → [{ port: 3000, protocol: "tcp", state: "open", url: "https://..." }]
-```
-
----
+A sandbox reports money in two halves: `cost` is accrued machine time and
+`llm_cost` is what its sessions spent on model tokens. `total_cost` is their
+sum and is the figure the `budget` is enforced against — show that one next
+to the budget.
 
 ## Files
 
 ```typescript
-// List directory
-const entries = await caged.files.list(sandbox.id, "/workspace/src");
+const entries = await caged.files.list(sandbox.id);           // /workspace
+const source = await caged.files.read(sandbox.id, "/workspace/a.js");
+await caged.files.write(sandbox.id, "/workspace/a.js", source + "\n");
 
-// Read a file
-const content = await caged.files.read(sandbox.id, "/workspace/package.json");
-
-// Write a file
-await caged.files.write(sandbox.id, "/workspace/hello.ts", 'console.log("hi")');
-
-// Git diff
 const diff = await caged.files.gitDiff(sandbox.id);
+for (const file of diff.files) console.log(file.status, file.path);
+console.log(diff.diff, diff.staged_diff);
 ```
 
----
+`read` returns the file's text — the endpoint answers `text/plain` — and
+files over 1MB are rejected by the API. `gitDiff` returns an object, not a
+string.
 
 ## Snapshots
 
 ```typescript
-// Create a snapshot
-const snapshot = await caged.snapshots.create(sandbox.id, {
-  name: "before-refactor",
-  description: "State before major refactoring",
-});
-
-// List snapshots
+const snapshot = await caged.snapshots.create(sandbox.id, { name: "cp1" });
 const snapshots = await caged.snapshots.list(sandbox.id);
 
-// Restore from snapshot
-await caged.snapshots.restore(snapshot.id);
+// A snapshot is restored into a sandbox you name, not back where it came from
+const replica = await caged.sandboxes.create({ template: "node-20" });
+await caged.snapshots.restore(snapshot.id, replica.id);
 
-// Get download URL
-const { url } = await caged.snapshots.downloadUrl(snapshot.id);
+const { url, expires_in_seconds } = await caged.snapshots.download(snapshot.id);
+await caged.snapshots.delete(snapshot.id);
 ```
 
----
+## Streaming Exec
+
+```typescript
+const stream = await caged.sandboxes.execStream(sandbox.id, "npm test");
+for await (const chunk of stream) process.stdout.write(chunk);
+
+// null if the connection dropped before the command finished: the status is
+// then unknown, not zero.
+console.log("Exit code:", stream.exitCode);
+```
+
+There is no streaming exec endpoint. This drives the terminal WebSocket and
+brackets the command with markers carrying a per-call nonce, so the login
+banner, the shell's echo and the prompt are stripped and the exit code is
+read back from the shell.
+
+## Interactive Terminal (WebSocket)
+
+```typescript
+const terminal = await caged.sandboxes.terminal(sandbox.id, { rows: 40, cols: 120 });
+terminal.onOutput((data) => process.stdout.write(data));
+terminal.onClose(() => console.log("closed"));
+terminal.send("ls -la\n");
+terminal.resize(50, 160);
+terminal.close();
+```
+
+A WebSocket handshake cannot carry an `Authorization` header, so the
+credential rides in the URL — where every proxy that logs a request line sees
+it. The SDK therefore mints a single-use ticket
+(`POST /v1/auth/socket-ticket`, exposed as `caged.socketTicket()`) for each
+socket and sends that instead of your API key, falling back to the key only
+against an API too old to serve tickets.
+
+## MCP (Model Context Protocol)
+
+```typescript
+const mcp = await caged.sandboxes.mcp(sandbox.id);   // initialises the session
+
+for (const tool of await mcp.listTools()) {
+  console.log(tool.name, tool.description);
+}
+
+const result = await mcp.callTool("filesystem_read", { path: "package.json" });
+console.log(result.content[0]?.text);
+
+mcp.close();
+```
+
+Also `listResources()`, `readResource(uri)`, `listPrompts()`,
+`getPrompt(name, args)`, `ping()`, `onNotification(handler)` and
+`onClose(handler)`. A JSON-RPC error surfaces as `MCPError` with the server's
+`code`.
 
 ## Agent Sessions & Replay
 
-View past AI agent sessions and replay their activity:
-
 ```typescript
-// List sessions for a sandbox
+// Every session in the account, newest first (paginated)
+const page = await caged.sessions.list(1);
+for (const s of page.data) {
+  console.log(
+    `${s.id}: LLM $${s.llm_cost} + compute $${s.compute_cost} = $${s.total_cost}`
+  );
+}
+
+// Or just one sandbox's sessions
 const sessions = await caged.sessions.listBySandbox(sandbox.id);
 
-// Get session details
-const session = await caged.sessions.get(sessionId);
-console.log(`Cost: $${session.cost_usd}, Tokens: ${session.tokens_in + session.tokens_out}`);
-
-// Get replay summary
-const summary = await caged.sessions.replaySummary(sessionId);
-console.log(`Duration: ${summary.duration_ms}ms, Tools: ${summary.tools_used.join(", ")}`);
-
-// Get full replay timeline
-const events = await caged.sessions.replay(sessionId);
-for (const event of events) {
-  console.log(`[${event.timestamp}] ${event.type}:`, event.data);
+// The replay endpoint answers an object, not a bare array.
+let replay = await caged.sessions.replay(sessions[0]!.id, { limit: 500 });
+for (const event of replay.events) console.log(event.sequence, event.type);
+while (replay.has_more) {
+  replay = await caged.sessions.replay(sessions[0]!.id, { afterSeq: replay.next_seq });
 }
+
+const summary = await caged.sessions.replaySummary(sessions[0]!.id);
+console.log(summary.event_count, summary.duration_ms, summary.types);
 ```
 
----
+A session's spend arrives as two halves and their sum: `llm_cost` (model
+tokens) plus `compute_cost` (this session's share of its sandbox's machine
+time) equals `total_cost`. `cost_usd` is the same blended total under the
+older name.
 
 ## Events (Observability)
 
-Push structured observability events to the Caged pipeline:
-
 ```typescript
-await caged.events.ingest([
+const response = await caged.events.ingest([
   {
     type: "llm_call",
     sandbox_id: sandbox.id,
-    data: {
-      model: "claude-sonnet-4-20250514",
-      tokens_in: 1500,
-      tokens_out: 800,
-      duration_ms: 2300,
-    },
-  },
-  {
-    type: "tool_call",
-    sandbox_id: sandbox.id,
-    data: {
-      tool: "filesystem_write",
-      path: "/workspace/src/app.ts",
-    },
+    // The server reads `payload`. Anything sent as `data` was discarded.
+    payload: { model: "claude-4", tokens_in: 500, tokens_out: 200 },
   },
 ]);
+console.log(response.accepted, response.errors);
 ```
 
----
+Max 1000 events per batch — the SDK refuses a larger one rather than letting
+the API reject the lot. `account_id` is taken from the API key, and an
+omitted `timestamp` is stamped as now, because the server rejects an event
+without one.
 
 ## Alerts & Notifications
 
 ```typescript
-// List alerts
-const alerts = await caged.alerts.list();
-await caged.alerts.resolve(alerts[0].id);
+const page = await caged.alerts.list({ limit: 50 });   // an object, not an array
+for (const alert of page.alerts) {
+  console.log(`[${alert.severity}] ${alert.title}: ${alert.message}`);
+}
+await caged.alerts.resolve(page.alerts[0]!.id);
 
-// Manage alert rules
-const rules = await caged.alerts.listRules();
-await caged.alerts.updateRule(rules[0].id, { enabled: true, threshold: 10 });
+// Rules: the tunables live in `config`, and only what you pass is changed.
+for (const rule of await caged.alerts.listRules()) {
+  await caged.alerts.updateRule(rule.id, { config: { threshold_percent: 80 } });
+}
 
-// Notifications
-const notifications = await caged.notifications.list();
-const { count } = await caged.notifications.unreadCount();
-await caged.notifications.markRead(notifications[0].id);
+console.log(await caged.notifications.unreadCount());
+const inbox = await caged.notifications.list({ limit: 20 });
+for (const note of inbox.notifications) console.log(note.channel, note.title);
 await caged.notifications.markAllRead();
-
-// Configure notification channels
-await caged.notifications.updateConfig({
-  slack_enabled: true,
-  slack_webhook_url: "https://hooks.slack.com/services/...",
-});
 ```
 
----
+A notification config read never returns a credential — for a webhook the URL
+*is* the credential — so each is reported as a `*_configured` boolean plus a
+hint. Write them with `updateConfig`, where an omitted field is left alone
+and `CLEAR_CREDENTIAL` removes one.
 
 ## Billing
 
 ```typescript
-// Check subscription
 const sub = await caged.billing.getSubscription();
-console.log(`Plan: ${sub.plan}, Status: ${sub.status}`);
+console.log(sub.tier, sub.status);          // the API calls the plan `tier`
 
-// Upgrade
-const { url } = await caged.billing.createCheckout("pro");
-// → redirect user to url
+const usage = await caged.billing.getUsage();
+console.log(usage.compute_minutes);
 
-// Manage billing
-const { url: portalUrl } = await caged.billing.createPortal();
-
-// Cancel
+const checkoutUrl = await caged.billing.createCheckout("pro");
+const portalUrl = await caged.billing.createPortal();
 await caged.billing.cancel();
 ```
-
----
 
 ## Account
 
 ```typescript
-// API keys
-const keys = await caged.account.listKeys();
-const newKey = await caged.account.createKey("ci-deploy");
-console.log(newKey.key); // Only shown once!
-await caged.account.revokeKey(newKey.id);
+const account = await caged.account.get();
 
-// Web sessions
+const created = await caged.account.createKey("ci", "read_only");
+console.log(created.key);        // the secret, shown exactly once
+console.log(created.info.id);    // the metadata listKeys() also returns
+
+await caged.account.revokeKey(created.info.id);
+
 const sessions = await caged.account.listSessions();
-await caged.account.revokeSession(sessions[0].id);
+await caged.account.revokeSession(sessions[0]!.id);
 ```
-
----
 
 ## Error Handling
 
+Every failure is a `CagedError`. API failures are `CagedAPIError` or one of
+its subclasses, and carry the server's own RFC 7807 problem detail as the
+message.
+
 ```typescript
-import { CagedAPIError, CagedTimeoutError } from "@caged-dev/sdk";
+import {
+  CagedAPIError,
+  CagedNotFoundError,
+  CagedPlanLimitError,
+  CagedTimeoutError,
+  CagedValidationError,
+} from "@caged-dev/sdk";
 
 try {
-  await caged.sandboxes.create({ template: "invalid" });
+  await caged.sandboxes.get("sbx_does_not_exist");
 } catch (err) {
-  if (err instanceof CagedAPIError) {
-    console.log(err.status); // 400, 401, 403, 404, 500
-    console.log(err.message); // Human-readable error
-  }
-  if (err instanceof CagedTimeoutError) {
-    console.log("Request timed out");
-  }
+  if (err instanceof CagedNotFoundError) console.log("no such sandbox");
+  else if (err instanceof CagedPlanLimitError) console.log(err.reason?.action);
+  else if (err instanceof CagedValidationError) console.log(`rejected: ${err.message}`);
+  else if (err instanceof CagedTimeoutError) console.log(err.timeoutMs);
+  else if (err instanceof CagedAPIError) console.log(err.status, err.problem?.detail);
+  else throw err;
 }
 ```
 
----
+| Class | Thrown for |
+|-------|-----------|
+| `CagedValidationError` | 400, 422 |
+| `CagedAuthError` | 401, 403 |
+| `CagedNotFoundError` | 404 |
+| `CagedPlanLimitError` | 403 with `reason.code === "plan_limit_reached"` |
+| `CagedRateLimitError` | 429 |
+| `CagedServerError` | 5xx |
+| `CagedAPIError` | any other non-2xx (base class of the above) |
+| `CagedTimeoutError` | the request exceeded its timeout |
+| `CagedConnectionError` | the transport failed before a response arrived |
+| `MCPError` | a JSON-RPC error from the sandbox's MCP server |
+| `CagedError` | base class of everything above |
+
+Refusals the API classified also carry a machine-readable `reason` (`code`,
+`message`, `action`, `subject_type`, `subject_id`). Branch on `reason.code` —
+the prose message may be reworded, the code will not.
 
 ## Full Example: Run Claude Code in a Sandbox
 
@@ -350,7 +353,6 @@ import { Caged } from "@caged-dev/sdk";
 
 const caged = new Caged({ apiKey: process.env.CAGED_API_KEY! });
 
-// Create sandbox with Claude Code
 const sandbox = await caged.sandboxes.create({
   template: "node-20",
   memory_mb: 2048,
@@ -360,38 +362,37 @@ const sandbox = await caged.sandboxes.create({
   budget: 2.0,
 });
 
-// Connect terminal and run Claude
-const terminal = await caged.sandboxes.terminal(sandbox.id);
+// Stream the agent's output, and get its exit code when it finishes.
+const stream = await caged.sandboxes.execStream(
+  sandbox.id,
+  'claude -p "add unit tests for the auth module"'
+);
+for await (const chunk of stream) process.stdout.write(chunk);
+console.log("\nagent exited", stream.exitCode);
 
-let output = "";
-terminal.onOutput((data) => {
-  output += data;
-  process.stdout.write(data);
-});
-
-terminal.send('claude -p "add unit tests for the auth module"\n');
-
-// Wait for completion (simplified — real usage would parse output)
-await new Promise((r) => setTimeout(r, 60000));
-
-// Check what changed
 const diff = await caged.files.gitDiff(sandbox.id);
-console.log("\nChanges made:\n", diff);
+for (const file of diff.files) console.log(file.status, file.path);
 
-// Check cost
 const sessions = await caged.sessions.listBySandbox(sandbox.id);
-console.log(`Cost: $${sessions[0]?.cost_usd}`);
+console.log(`Cost: $${sessions[0]?.total_cost}`);
 
-terminal.close();
 await caged.sandboxes.destroy(sandbox.id);
 ```
 
----
+## Development
 
-## Requirements
+```bash
+pnpm install
+pnpm lint            # tsc --noEmit
+pnpm test            # vitest
+pnpm build           # tsup: ESM + CJS + .d.ts
+pnpm verify-tarball  # inspect what `npm i` would unpack
+```
 
-- Node.js 18+ (uses native `fetch` and `WebSocket`)
-- For older environments, polyfill `WebSocket` (e.g., `ws` package)
+Tests inject a `fetch` and a fake WebSocket; nothing in the suite touches the
+network. `verify-tarball` exists because checking the source proves nothing
+about what gets published — 0.2.0 was a repackage of 0.1.0 and every check in
+CI passed.
 
 ## License
 

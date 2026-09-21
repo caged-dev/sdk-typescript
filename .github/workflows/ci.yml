@@ -8,8 +8,13 @@ on:
 
 jobs:
   test:
-    name: Test
+    name: Test (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 18 is the floor `engines` declares: the package needs global fetch.
+        node-version: ['18', '20', '22']
     steps:
       - uses: actions/checkout@v4
 
@@ -19,7 +24,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: ${{ matrix.node-version }}
           cache: 'pnpm'
 
       - name: Install dependencies
@@ -31,5 +36,40 @@ jobs:
       - name: Build
         run: pnpm build
 
+      # No `|| true`. This step used to carry it, against a repository with no
+      # tests at all, which is how a client whose every file write 400'd
+      # stayed invisible behind a green CI run.
       - name: Test
-        run: pnpm test || true
+        run: pnpm test
+
+  artifact:
+    name: Inspect the built tarball
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      # 0.2.0 was published as a repackage of 0.1.0 and nobody noticed,
+      # because every check ran against the working tree. This one runs
+      # against what `npm i` unpacks.
+      - name: Inspect the artifact
+        run: pnpm verify-tarball
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

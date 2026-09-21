@@ -10,50 +10,59 @@
  * terminal.close();
  * ```
  */
+import { CagedError } from "./errors";
+import type { WebSocketLike } from "./types";
+
 export class TerminalSession {
-  private ws: WebSocket;
-  private outputHandlers: ((data: string) => void)[] = [];
-  private closeHandlers: (() => void)[] = [];
-  private errorHandlers: ((err: Error) => void)[] = [];
-  private _closed = false;
+  private readonly ws: WebSocketLike;
+  private readonly outputHandlers: ((data: string) => void)[] = [];
+  private readonly closeHandlers: (() => void)[] = [];
+  private readonly errorHandlers: ((err: Error) => void)[] = [];
+  private isClosed = false;
 
   /** @internal */
-  constructor(ws: WebSocket) {
+  constructor(ws: WebSocketLike) {
     this.ws = ws;
     this.ws.addEventListener("message", (event) => {
+      const data = event.data;
+      if (data === undefined || data === null) return;
+      const text = String(data);
+      let parsed: unknown;
       try {
-        const msg = JSON.parse(String(event.data));
-        if (msg.type === "output" && msg.data) {
-          for (const handler of this.outputHandlers) {
-            handler(msg.data);
-          }
-        }
+        parsed = JSON.parse(text);
       } catch {
-        // Raw text fallback.
-        for (const handler of this.outputHandlers) {
-          handler(String(event.data));
+        // Raw frame: still output.
+        this.emit(text);
+        return;
+      }
+      if (typeof parsed === "object" && parsed !== null) {
+        const msg = parsed as { type?: unknown; data?: unknown };
+        if (msg.type === "output" && typeof msg.data === "string" && msg.data) {
+          this.emit(msg.data);
         }
       }
     });
     this.ws.addEventListener("close", () => {
-      this._closed = true;
+      this.isClosed = true;
       for (const handler of this.closeHandlers) handler();
     });
-    this.ws.addEventListener("error", (event) => {
-      const err = new Error("WebSocket error");
+    this.ws.addEventListener("error", () => {
+      const err = new CagedError("WebSocket error on the terminal session");
       for (const handler of this.errorHandlers) handler(err);
     });
   }
 
-  /** Send input to the terminal (include \n for Enter). */
+  /** Send input to the terminal (include `\n` for Enter). */
   send(input: string): void {
-    if (this._closed) throw new Error("Terminal session is closed");
+    if (this.isClosed) {
+      throw new CagedError("Terminal session is closed");
+    }
     this.ws.send(JSON.stringify({ type: "input", data: input }));
   }
 
   /** Resize the terminal. */
   resize(rows: number, cols: number): void {
-    if (this._closed) return;
+    if (this.isClosed) return;
     this.ws.send(JSON.stringify({ type: "resize", rows, cols }));
   }
 
@@ -74,14 +83,17 @@ export class TerminalSession {
 
   /** Whether the session is closed. */
   get closed(): boolean {
-    return this._closed;
+    return this.isClosed;
   }
 
   /** Close the terminal session. */
   close(): void {
-    if (!this._closed) {
-      this._closed = true;
-      this.ws.close();
-    }
+    if (this.isClosed) return;
+    this.isClosed = true;
+    this.ws.close();
+  }
+
+  private emit(data: string): void {
+    for (const handler of this.outputHandlers) handler(data);
   }
 }

@@ -3,12 +3,9 @@ name: Publish to npm
 on:
   release:
     types: [published]
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version to publish (e.g. 0.2.0, or bump type: patch/minor/major)'
-        required: false
-        default: ''
+  push:
+    tags:
+      - 'v*'
 
 jobs:
   publish:
@@ -16,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
+      id-token: write   # npm provenance
 
     steps:
       - uses: actions/checkout@v4
@@ -27,28 +24,45 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
           cache: 'pnpm'
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # The tag names the release; package.json and src/version.ts declare the
+      # version. If they disagree, that is a mistake to stop on, not to paper
+      # over: the job used to run `npm version` to force package.json to match
+      # the tag, producing an artifact whose version belongs to no commit.
+      # That is the shape of how 0.2.0 shipped 0.1.0's code under a new
+      # number, with a User-Agent that still said 0.1.0.
+      - name: Check the tag matches the source
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          TAG_VERSION="${TAG#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          echo "tag=$TAG_VERSION package.json=$PKG_VERSION"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::tag $TAG_VERSION does not match package.json ($PKG_VERSION)"
+            exit 1
+          fi
+
+      # Nothing is published that has not passed the same gates as a PR.
+      # `pnpm test` here also asserts src/version.ts agrees with package.json.
+      - name: Lint
+        run: pnpm lint
+
       - name: Build
         run: pnpm build
 
-      - name: Bump version (manual dispatch)
-        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''
-        run: |
-          VERSION_INPUT="${{ github.event.inputs.version }}"
-          npm version "$VERSION_INPUT" --no-git-tag-version
+      - name: Test
+        run: pnpm test
 
-      - name: Set version from release tag
-        if: github.event_name == 'release'
+      - name: Inspect the artifact
         run: |
-          TAG="${{ github.event.release.tag_name }}"
-          VERSION="${TAG#v}"
-          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          TAG="${GITHUB_REF#refs/tags/}"
+          pnpm verify-tarball "${TAG#v}"
 
       - name: Publish to npm
         run: npm publish --access public --provenance
