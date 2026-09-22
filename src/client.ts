@@ -46,6 +46,23 @@ import type {
   Usage,
   WebSocketFactory,
   WebSocketLike,
+  MCPBinding,
+  MCPBindParams,
+  MCPBindResult,
+  MCPCatalogueEntry,
+  MCPGrantResult,
+  MCPInputRequest,
+  MCPOAuthAuthorization,
+  MCPOAuthConsent,
+  MCPOAuthState,
+  MCPPolicyAdvice,
+  MCPRefreshReport,
+  MCPServer,
+  MCPServerCreateParams,
+  MCPServerDetail,
+  MCPServerTool,
+  MCPToolDiff,
+  MCPToolRevision,
 } from "./types";
 import { VERSION } from "./version";
 
@@ -103,6 +120,7 @@ export class Caged {
   public readonly alerts: AlertsAPI;
   public readonly notifications: NotificationsAPI;
   public readonly billing: BillingAPI;
+  public readonly mcp: MCPAPI;
 
   constructor(config: CagedConfig) {
     if (!config.apiKey) {
@@ -132,6 +150,7 @@ export class Caged {
     this.alerts = new AlertsAPI(this);
     this.notifications = new NotificationsAPI(this);
     this.billing = new BillingAPI(this);
+    this.mcp = new MCPAPI(this);
   }
 
   /** @internal Performs the request and returns the undecoded body. */
@@ -1055,4 +1074,534 @@ function warnDeprecated(message: string): void {
   if (warned.has(message)) return;
   warned.add(message);
   console.warn(`[@caged-dev/sdk] ${message}`);
+}
+
+/**
+ * `client.mcp` — third-party MCP servers an agent in a sandbox can use.
+ *
+ * Two facts about this surface are worth reading before the methods, because
+ * each is the difference between a working setup and a silent one, and neither
+ * is visible from a successful HTTP response:
+ *
+ * **Binding a server does not make its tools callable.** Caged's autonomy-tier
+ * table classifies its *own* tool names — `filesystem_read`, `terminal_exec`,
+ * `git_push`. A brokered name like `github__get_issue` matches none of them, so
+ * it is unclassified, and an unclassified tool is denied at **every** tier
+ * including `autonomous`. That default is deliberate: Caged cannot know whether
+ * a stranger's tool reads an issue or wires money.
+ *
+ * {@link MCPAPI.bind} returns the advice on its result, `allowTools: true`
+ * writes the rule in the same request, {@link MCPAPI.allow} writes it later, and
+ * {@link MCPAPI.readiness} answers for every bound server at once.
+ *
+ * **A `quarantined` tool is a definition that CHANGED** since a human approved
+ * it. Caged hashes every tool definition at refresh and holds a changed one, so
+ * a server that is benign on Monday and poisoned on Tuesday becomes a review
+ * rather than a silent compromise. {@link MCPAPI.toolDiff} shows the approved
+ * definition beside the current one; approving without reading it is the outcome
+ * the mechanism exists to prevent.
+ *
+ * Nothing here returns a credential or a token. The types have no field for one.
+ */
+class MCPAPI {
+  public readonly servers: MCPServersAPI;
+  public readonly bindings: MCPBindingsAPI;
+  public readonly oauth: MCPOAuthAPI;
+  public readonly inputs: MCPInputsAPI;
+
+  constructor(private client: Caged) {
+    this.servers = new MCPServersAPI(client);
+    this.bindings = new MCPBindingsAPI(client);
+    this.oauth = new MCPOAuthAPI(client);
+    this.inputs = new MCPInputsAPI(client);
+  }
+
+  /**
+   * The servers Caged has reviewed.
+   *
+   * A server registered from this catalogue is `verified` and its tools arrive
+   * usable. One registered from an arbitrary URL is not, and its tools are held
+   * for review.
+   */
+  async catalogue(): Promise<MCPCatalogueEntry[]> {
+    const body = await this.client.requestJSON<{ servers?: MCPCatalogueEntry[] }>({
+      method: "GET",
+      path: "/mcp/catalogue",
+    });
+    return body.servers ?? [];
+  }
+
+  /** Make a server's tools visible to a subject. */
+  async bind(serverId: string, params: MCPBindParams = {}): Promise<MCPBindResult> {
+    return this.bindings.create(serverId, params);
+  }
+
+  /** Remove a binding. It takes effect on the agent's next `tools/list`. */
+  async unbind(bindingId: string): Promise<void> {
+    return this.bindings.delete(bindingId);
+  }
+
+  /** The pinned tool catalogue for one server, as an agent sees it. */
+  async tools(serverId: string): Promise<MCPServerTool[]> {
+    const detail = await this.servers.get(serverId);
+    return detail.tools ?? [];
+  }
+
+  /**
+   * Whether policy will allow each bound server's tools for a persona.
+   *
+   * This is the call to make when brokered calls are being refused and it is not
+   * obvious why. Every entry carries a `status` from a closed set, the deciding
+   * rule, and a `remedy`. Use {@link mcpNeedsAllowRule} to find the ones that
+   * one `allow` call would fix.
+   */
+  async readiness(personaId?: string): Promise<MCPPolicyAdvice[]> {
+    const body = await this.client.requestJSON<{ servers?: MCPPolicyAdvice[] }>({
+      method: "GET",
+      path: "/mcp/readiness",
+      query: personaId ? { persona_id: personaId } : undefined,
+    });
+    return body.servers ?? [];
+  }
+
+  /** Whether policy will allow one server's tools for a persona. */
+  async advice(serverId: string, personaId?: string): Promise<MCPPolicyAdvice> {
+    return this.client.requestJSON<MCPPolicyAdvice>({
+      method: "GET",
+      path: `/mcp/servers/${encodeURIComponent(serverId)}/advice`,
+      query: personaId ? { persona_id: personaId } : undefined,
+    });
+  }
+
+  /**
+   * Write the one policy rule that makes a server's tools callable.
+   *
+   * The rule is `allow tool <alias>__*` at glob priority: above the catch-all
+   * deny and **below** every always-on guardrail, so allowing an external server
+   * can never override the secret-path or private-network rules.
+   *
+   * `personaId` is required, and not as an oversight. Caged's account policy
+   * layer is restriction-only — it decides only on an explicit deny or pause and
+   * otherwise allows by default — so an allow rule written there would be
+   * stored, displayed, and have no effect whatsoever.
+   *
+   * If the persona has no stored policy, Caged creates one as an exact copy of
+   * its tier template plus this rule, and says so in `policy_created`. A policy
+   * containing only the allow rule would silently drop every guardrail the
+   * template carries, because a stored persona policy *replaces* the template
+   * rather than layering over it.
+   *
+   * Idempotent: a second call reports `already_present`.
+   */
+  async allow(serverId: string, personaId: string): Promise<MCPGrantResult> {
+    if (!personaId) {
+      throw new CagedError(
+        "personaId is required: an allow rule for an external MCP server lives on a " +
+          "persona's policy, because Caged's account policy layer can only restrict and " +
+          "never grant"
+      );
+    }
+    return this.client.requestJSON<MCPGrantResult>({
+      method: "POST",
+      path: `/mcp/servers/${encodeURIComponent(serverId)}/allow`,
+      body: { persona_id: personaId },
+    });
+  }
+
+  /**
+   * Remove the rule Caged wrote.
+   *
+   * Only that rule. A rule you wrote yourself that happens to allow the same
+   * pattern is left alone — deleting somebody else's rule for looking like ours
+   * turns an undo into an outage.
+   */
+  async disallow(serverId: string, personaId: string): Promise<void> {
+    if (!personaId) throw new CagedError("personaId is required");
+    await this.client.requestVoid({
+      method: "DELETE",
+      path: `/mcp/servers/${encodeURIComponent(serverId)}/allow`,
+      query: { persona_id: personaId },
+    });
+  }
+
+  /**
+   * The definition a human approved, beside the one being advertised now.
+   *
+   * Read this before {@link MCPAPI.approveTool}. A review with one side is a
+   * consent dialog with the text removed, and it trains a reviewer to click
+   * approve.
+   */
+  async toolDiff(serverId: string, tool: string): Promise<MCPToolDiff> {
+    return this.client.requestJSON<MCPToolDiff>({
+      method: "GET",
+      path: `/mcp/servers/${encodeURIComponent(serverId)}/tools/${encodeURIComponent(tool)}/diff`,
+    });
+  }
+
+  /**
+   * Every definition this server has advertised for this tool.
+   *
+   * Keyed by digest, so a server that reverts to a previously approved
+   * definition produces no second review, and a rejection survives a server
+   * re-advertising the same bytes on a loop.
+   */
+  async toolRevisions(serverId: string, tool: string): Promise<MCPToolRevision[]> {
+    const body = await this.client.requestJSON<{ revisions?: MCPToolRevision[] }>({
+      method: "GET",
+      path:
+        `/mcp/servers/${encodeURIComponent(serverId)}/tools/` +
+        `${encodeURIComponent(tool)}/revisions`,
+    });
+    return body.revisions ?? [];
+  }
+
+  /**
+   * Release a pending or quarantined tool.
+   *
+   * Refused with a conflict if the definition carries an `injection` or
+   * `shadowing` flag: approving prompt-injected metadata is the exact outcome
+   * the mechanism exists to prevent, so it is not one click.
+   */
+  async approveTool(serverId: string, tool: string): Promise<void> {
+    await this.client.requestVoid({
+      method: "POST",
+      path:
+        `/mcp/servers/${encodeURIComponent(serverId)}/tools/` +
+        `${encodeURIComponent(tool)}/approve`,
+    });
+  }
+
+  /**
+   * Refuse a held definition, durably.
+   *
+   * The tool stays unavailable to every agent, and the refusal is recorded
+   * against this exact definition — so a server re-advertising the same bytes
+   * does not re-open the review.
+   */
+  async rejectTool(serverId: string, tool: string, note = ""): Promise<void> {
+    await this.client.requestVoid({
+      method: "POST",
+      path:
+        `/mcp/servers/${encodeURIComponent(serverId)}/tools/` +
+        `${encodeURIComponent(tool)}/reject`,
+      body: { note },
+    });
+  }
+}
+
+/** `client.mcp.servers` — registrations. */
+class MCPServersAPI {
+  constructor(private client: Caged) {}
+
+  /**
+   * Register a third-party MCP server.
+   *
+   * Registering makes a server **known**. It is visible to nothing until it is
+   * bound, and its tools are denied by policy until a rule allows them: the
+   * default visible set for an agent is empty, and that is the design rather
+   * than a safety net.
+   *
+   * `credential` is sealed by the API immediately and is never returned by any
+   * read. `authKind: "oauth"` stores no credential at all — the token comes from
+   * a human completing the consent flow in `client.mcp.oauth`, and the result's
+   * `oauth_next_step` names it.
+   */
+  async add(params: MCPServerCreateParams): Promise<MCPServer> {
+    if (!params.catalogueId && !params.endpoint) {
+      throw new CagedError(
+        "one of catalogueId or endpoint is required; " +
+          "client.mcp.catalogue() lists the reviewed servers"
+      );
+    }
+    const body: Record<string, unknown> = {};
+    if (params.catalogueId) body.catalogue_id = params.catalogueId;
+    if (params.alias) body.alias = params.alias;
+    if (params.endpoint) body.endpoint = params.endpoint;
+    if (params.displayName) body.display_name = params.displayName;
+    if (params.description) body.description = params.description;
+    if (params.authKind) body.auth_kind = params.authKind;
+    if (params.credential) body.credential = params.credential;
+    if (params.headers && Object.keys(params.headers).length > 0) {
+      body.headers = params.headers;
+      if (!body.auth_kind) body.auth_kind = "header";
+    }
+    if (params.credential && !body.auth_kind) body.auth_kind = "bearer";
+    return this.client.requestJSON<MCPServer>({
+      method: "POST",
+      path: "/mcp/servers",
+      body,
+    });
+  }
+
+  /** List the account's registrations. */
+  async list(): Promise<MCPServer[]> {
+    const body = await this.client.requestJSON<{ servers?: MCPServer[] }>({
+      method: "GET",
+      path: "/mcp/servers",
+    });
+    return body.servers ?? [];
+  }
+
+  /** One registration and its pinned tool catalogue. */
+  async get(serverId: string): Promise<MCPServerDetail> {
+    return this.client.requestJSON<MCPServerDetail>({
+      method: "GET",
+      path: `/mcp/servers/${encodeURIComponent(serverId)}`,
+    });
+  }
+
+  /** Deregister a server, its catalogue and every binding to it. */
+  async remove(serverId: string): Promise<void> {
+    await this.client.requestVoid({
+      method: "DELETE",
+      path: `/mcp/servers/${encodeURIComponent(serverId)}`,
+    });
+  }
+
+  /**
+   * Re-fetch the server's tool catalogue and report what changed.
+   *
+   * A definition whose digest differs from the stored one is **quarantined**,
+   * not merged: it is advertised to no agent and fails the gate until a human
+   * decides. Read `quarantined` and then {@link MCPAPI.toolDiff}.
+   */
+  async refresh(serverId: string): Promise<MCPRefreshReport> {
+    return this.client.requestJSON<MCPRefreshReport>({
+      method: "POST",
+      path: `/mcp/servers/${encodeURIComponent(serverId)}/refresh`,
+    });
+  }
+}
+
+/** `client.mcp.bindings` — who sees which server. */
+class MCPBindingsAPI {
+  constructor(private client: Caged) {}
+
+  /** Bind a server to a persona, or to the account. */
+  async create(serverId: string, params: MCPBindParams = {}): Promise<MCPBindResult> {
+    const body: Record<string, unknown> = {
+      server_id: serverId,
+      subject_kind: params.personaId ? "persona" : "account",
+    };
+    if (params.personaId) body.subject_id = params.personaId;
+    if (params.tools && params.tools.length > 0) body.tool_allowlist = params.tools;
+    if (params.deny && params.deny.length > 0) body.tool_denylist = params.deny;
+    if (params.pinned) body.pinned = true;
+    if (params.argumentCeilingBytes) {
+      body.argument_ceiling_bytes = params.argumentCeilingBytes;
+    }
+    // Omitted rather than sent as false, so a server that ever changes its
+    // default is not overridden by a client that did not mean to.
+    if (params.allowTools) body.allow_tools = true;
+    return this.client.requestJSON<MCPBindResult>({
+      method: "POST",
+      path: "/mcp/bindings",
+      body,
+    });
+  }
+
+  /** List the account's bindings. */
+  async list(): Promise<MCPBinding[]> {
+    const body = await this.client.requestJSON<{ bindings?: MCPBinding[] }>({
+      method: "GET",
+      path: "/mcp/bindings",
+    });
+    return body.bindings ?? [];
+  }
+
+  /** Remove a binding. */
+  async delete(bindingId: string): Promise<void> {
+    await this.client.requestVoid({
+      method: "DELETE",
+      path: `/mcp/bindings/${encodeURIComponent(bindingId)}`,
+    });
+  }
+}
+
+/**
+ * `client.mcp.oauth` — authorizing a server, consent first.
+ *
+ * The order of these three calls **is** the security property, so they are three
+ * calls rather than one:
+ *
+ * 1. {@link MCPOAuthAPI.show} — read-only. Says which authorization server a
+ *    browser would be sent to and which scopes are being asked for. Mints
+ *    nothing.
+ * 2. {@link MCPOAuthAPI.consent} — records the human decision. Forwards nothing.
+ * 3. {@link MCPOAuthAPI.authorize} — requires a live consent, and only then
+ *    mints a single-use state and returns the URL to open.
+ *
+ * One call that discovered, minted and redirected would be a side-effecting
+ * action reachable by anybody who could make an authenticated operator's browser
+ * visit it: a real authorization flow attributed to that operator, against a
+ * server they never chose, for scopes they never read. Caged is a proxy holding
+ * credentials for many upstreams on behalf of many subjects, which is the exact
+ * position that attack is described from.
+ *
+ * Caged holds the resulting token itself: sealed at rest, never written into a
+ * sandbox, never in an environment variable, and never returned by any read.
+ */
+class MCPOAuthAPI {
+  constructor(private client: Caged) {}
+
+  /**
+   * What is authorized, and what authorizing would involve.
+   *
+   * Read-only. If discovery fails, `discovery_error` is set and `status` is
+   * still real: what is authorized remains true when a third party's metadata
+   * endpoint is down.
+   */
+  async show(serverId: string): Promise<MCPOAuthState> {
+    return this.client.requestJSON<MCPOAuthState>({
+      method: "GET",
+      path: `/mcp/servers/${encodeURIComponent(serverId)}/oauth`,
+    });
+  }
+
+  /**
+   * Record the human decision. Nothing is forwarded to the third party.
+   *
+   * Omitting `personaId` records an ACCOUNT-wide consent, which is a real and
+   * different decision: making an operator record the same one per persona is
+   * how a consent record becomes a rubber stamp. A persona's own consent
+   * outranks the account-wide one.
+   *
+   * Show `prospect.consent_statement` to the human first. A consent recorded
+   * from a discovered value nobody read is not a consent.
+   */
+  async consent(
+    serverId: string,
+    params: { issuer: string; scopes: string[]; personaId?: string }
+  ): Promise<MCPOAuthConsent> {
+    if (!params.issuer) {
+      throw new CagedError(
+        "issuer is required: a consent names the authorization server it is for, and a " +
+          "server that later names a different one needs a new consent"
+      );
+    }
+    const body: Record<string, unknown> = {
+      approve: true,
+      issuer: params.issuer,
+      scopes: params.scopes,
+    };
+    // Omitted rather than sent empty: the API reads an empty string as a
+    // malformed UUID, not as "account-wide".
+    if (params.personaId) body.persona_id = params.personaId;
+    const response = await this.client.requestJSON<{ consent?: MCPOAuthConsent }>({
+      method: "POST",
+      path: `/mcp/servers/${encodeURIComponent(serverId)}/oauth/consent`,
+      body,
+    });
+    return (response.consent ?? (response as unknown as MCPOAuthConsent));
+  }
+
+  /**
+   * The URL to open. Requires a recorded consent.
+   *
+   * Throws a conflict when no live consent covers this subject — that refusal is
+   * the confused-deputy mitigation, not a missing feature — and when the
+   * recorded consent does not cover a scope the server now requires, naming the
+   * missing scope.
+   */
+  async authorize(serverId: string, personaId?: string): Promise<MCPOAuthAuthorization> {
+    const body: Record<string, unknown> = {};
+    if (personaId) body.persona_id = personaId;
+    return this.client.requestJSON<MCPOAuthAuthorization>({
+      method: "POST",
+      path: `/mcp/servers/${encodeURIComponent(serverId)}/oauth/authorize`,
+      body,
+    });
+  }
+
+  /**
+   * Delete the stored token.
+   *
+   * The consent is kept: disconnecting and withdrawing permission are different
+   * decisions, and conflating them would make a reconnect silently permitted.
+   * Use {@link MCPOAuthAPI.revokeConsent} for the other one.
+   */
+  async forget(serverId: string): Promise<void> {
+    await this.client.requestVoid({
+      method: "DELETE",
+      path: `/mcp/servers/${encodeURIComponent(serverId)}/oauth`,
+    });
+  }
+
+  /** Withdraw a recorded consent. */
+  async revokeConsent(serverId: string, consentId: string): Promise<void> {
+    await this.client.requestVoid({
+      method: "DELETE",
+      path: `/mcp/servers/${encodeURIComponent(serverId)}/oauth/consent`,
+      query: { consent_id: consentId },
+    });
+  }
+}
+
+/**
+ * `client.mcp.inputs` — questions servers asked, waiting on a person.
+ *
+ * Under the current MCP revision a server can ask the client a question
+ * mid-call. Caged routes it to a **human** rather than to the agent's model: in
+ * an unattended run the alternative is a model answering a stranger's question
+ * on somebody's behalf, which is what every other MCP client does.
+ *
+ * A *sampling* request — "run an inference on my prompt and hand back the
+ * completion" — never appears here. It is refused outright, because no approval
+ * makes spending the account's tokens on a third party's prompt safe.
+ */
+class MCPInputsAPI {
+  constructor(private client: Caged) {}
+
+  /** The questions waiting on a person. */
+  async list(): Promise<MCPInputRequest[]> {
+    const body = await this.client.requestJSON<{ inputs?: MCPInputRequest[] }>({
+      method: "GET",
+      path: "/mcp/inputs",
+    });
+    return body.inputs ?? [];
+  }
+
+  /** One question set. */
+  async get(inputId: string): Promise<MCPInputRequest> {
+    return this.client.requestJSON<MCPInputRequest>({
+      method: "GET",
+      path: `/mcp/inputs/${encodeURIComponent(inputId)}`,
+    });
+  }
+
+  /**
+   * Answer a server's question, or decline it.
+   *
+   * `answers` maps a question id to the JSON value that answers it.
+   *
+   * The agent's **next attempt at the same call** carries the answer to the
+   * server. Caged does not re-send the call itself: a tool call whose side effect
+   * may be half-done must not be repeated by infrastructure.
+   *
+   * A decline is a first-class answer, forwarded once as a real `decline`, so a
+   * server that asked is told no rather than left waiting.
+   */
+  async respond(
+    inputId: string,
+    params: { answers?: Record<string, unknown>; decline?: boolean; note?: string }
+  ): Promise<void> {
+    const hasAnswers = params.answers && Object.keys(params.answers).length > 0;
+    if (!params.decline && !hasAnswers) {
+      throw new CagedError("answers or decline: true is required");
+    }
+    const body: Record<string, unknown> = { note: params.note ?? "" };
+    if (params.decline) {
+      body.decline = true;
+    } else {
+      body.answers = Object.entries(params.answers ?? {}).map(([id, content]) => ({
+        id,
+        content,
+      }));
+    }
+    await this.client.requestVoid({
+      method: "POST",
+      path: `/mcp/inputs/${encodeURIComponent(inputId)}/respond`,
+      body,
+    });
+  }
 }

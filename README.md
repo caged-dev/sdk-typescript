@@ -198,6 +198,127 @@ Also `listResources()`, `readResource(uri)`, `listPrompts()`,
 `onClose(handler)`. A JSON-RPC error surfaces as `MCPError` with the server's
 `code`.
 
+## Third-party MCP servers (`client.mcp.*`)
+
+The section above is the MCP server Caged **is**. This one is about the MCP
+servers Caged **uses**: GitHub, Linear, Postgres — other people's servers,
+reached by the agent inside a sandbox without widening that sandbox's egress by
+one byte. The API dials out; the guest does not. Tools arrive on the connection
+the agent already has, namespaced `alias__tool`.
+
+```ts
+import { Caged, mcpNeedsAllowRule } from "@caged-dev/sdk";
+
+const caged = new Caged({ apiKey: process.env.CAGED_API_KEY! });
+
+// 1. register
+const server = await caged.mcp.servers.add({
+  alias: "github",
+  catalogueId: "io.github.github/github-mcp-server",
+  credential: process.env.GITHUB_TOKEN,
+});
+
+// 2. fetch and pin its tool catalogue
+const report = await caged.mcp.servers.refresh(server.id);
+console.log(report.added, report.quarantined);
+
+// 3. bind it, and write the policy rule in the same request
+const result = await caged.mcp.bind(server.id, {
+  personaId: persona.id,
+  allowTools: true,
+});
+console.log(result.policy_advice?.status);        // "allowed"
+
+// 4. and when calls are still being refused, ask why
+for (const advice of await caged.mcp.readiness(persona.id)) {
+  if (mcpNeedsAllowRule(advice)) {
+    console.log(advice.explanation);
+    await caged.mcp.allow(advice.server_id, persona.id);
+  }
+}
+```
+
+### Two things that will otherwise cost you an afternoon
+
+**Binding a server does not make its tools callable.** Caged's autonomy tiers
+rank *its own* tools — `filesystem_read`, `terminal_exec`, `git_push`. A
+third-party name like `github__get_issue` matches none of them, so it is
+unclassified, and an unclassified tool is denied at **every** tier including
+`autonomous`. That is deliberate: Caged cannot know whether a stranger's tool
+reads an issue or wires money.
+
+`bind(..., { allowTools: true })` writes the one rule that clears it, `allow()`
+writes it later, and `readiness()` tells you which servers still need it —
+`mcpNeedsAllowRule(advice)` is the predicate. Nothing here silently widens
+anything: `allow()` writes exactly one rule, `allow tool <alias>__*`, above the
+catch-all deny and **below** every always-on guardrail.
+
+**A `quarantined` tool is one whose definition CHANGED** since a human approved
+it. Caged hashes every tool definition at refresh and holds a changed one, so a
+server that is benign on Monday and poisoned on Tuesday becomes a review rather
+than a silent compromise. Read the change before deciding:
+
+```ts
+const diff = await caged.mcp.toolDiff(server.id, "get_issue");
+console.log(diff.explanation);           // leads with the parameter change
+console.log(diff.added_properties);      // ["debug_context"] — a new exfil field
+console.log(diff.approved?.description); // what a human approved
+console.log(diff.current?.description);  // what the server advertises now
+
+await caged.mcp.approveTool(server.id, "get_issue");
+await caged.mcp.rejectTool(server.id, "get_issue", "grew a debug_context parameter");
+```
+
+### OAuth is three calls on purpose
+
+```ts
+const state = await caged.mcp.oauth.show(server.id);      // read-only; mints nothing
+console.log(state.prospect?.issuer, state.prospect?.scopes);
+console.log(state.prospect?.consent_statement);           // show this to the human
+
+await caged.mcp.oauth.consent(server.id, {                // the decision; forwards nothing
+  issuer: state.prospect!.issuer,
+  scopes: state.prospect!.scopes,
+  personaId: persona.id,
+});
+
+const auth = await caged.mcp.oauth.authorize(server.id, persona.id);
+console.log(auth.authorization_url);                      // open this; single-use, 10 min
+```
+
+The order is the point. One call that discovered, minted a state and redirected
+would be a side-effecting action reachable by anybody who could make an
+authenticated operator's browser visit it — a real authorization flow attributed
+to that operator, against a server they never chose, for scopes they never read.
+
+Caged holds the resulting token itself: sealed at rest, never written into a
+sandbox, never in an environment variable, and never returned by any read. None
+of the types in this SDK has a field for one.
+
+### When a server asks a question
+
+Under the current MCP revision a server can ask the client a question mid-call.
+Caged routes it to a **person**, not to the agent's model — in an unattended run
+the alternative is a model answering a stranger's question on your behalf.
+
+```ts
+for (const request of await caged.mcp.inputs.list()) {
+  for (const question of request.questions) {
+    console.log(request.tool, question.message);
+  }
+  await caged.mcp.inputs.respond(request.id, { answers: { team: { team: "platform" } } });
+  // or: await caged.mcp.inputs.respond(request.id, { decline: true, note: "not this run" });
+}
+```
+
+The agent's next attempt at the same call carries your answer. Caged does not
+re-send the call itself: a tool call whose side effect may be half-done must not
+be repeated by infrastructure.
+
+A *sampling* request — "run an inference on my prompt and hand back the
+completion" — never appears in that list. It is refused outright, because no
+approval makes spending your tokens on a third party's prompt safe.
+
 ## Agent Sessions & Replay
 
 ```typescript

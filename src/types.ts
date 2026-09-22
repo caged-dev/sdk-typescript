@@ -650,3 +650,439 @@ export type Session = AccountSession;
  * Removed no earlier than 0.5.0.
  */
 export type TrustScore = TrustScoreSummary;
+
+// --- third-party MCP servers -------------------------------------------------
+//
+// These mirror caged-api's `internal/api` MCP surface. Two of them carry the
+// facts that decide whether a setup works or fails silently, so they are worth
+// reading before the rest:
+//
+//  * `MCPPolicyAdvice` — whether policy will actually allow a bound server's
+//    tools. A brokered tool name matches nothing in Caged's autonomy-tier
+//    table, so a bound external tool is denied at every tier until a rule
+//    allows it. Binding alone is not enough, and this type is how the SDK says
+//    so rather than leaving it to the docs.
+//  * `MCPToolDiff` — the definition a human approved beside the one the server
+//    is advertising now. Approving a change without reading it is the outcome
+//    digest pinning exists to prevent.
+//
+// None of these has a field for a credential or a token, and none ever will:
+// Caged does not return one, and a type with a field for it would surface one
+// the day the API changed.
+
+export type MCPServerStatus = "pending" | "active" | "quarantined" | "disabled";
+export type MCPToolState = "pending" | "active" | "quarantined" | "withdrawn";
+export type MCPAuthKind = "none" | "bearer" | "header" | "oauth";
+
+/**
+ * How policy currently answers for one server's tools.
+ *
+ * `"unknown"` is never a synonym for allowed: an unresolvable policy is
+ * reported as unknown, because a readiness screen that renders a resolution
+ * failure as a green tick is worse than one that renders nothing.
+ */
+export type MCPPolicyStatus =
+  | "allowed"
+  | "partial"
+  | "needs_approval"
+  | "unclassified"
+  | "denied"
+  | "no_tools"
+  | "unknown";
+
+/** One registered third-party MCP server. */
+export interface MCPServer {
+  id: string;
+  /** Tools from this server are namespaced `alias__tool`. */
+  alias: string;
+  display_name: string;
+  description?: string;
+  transport: string;
+  endpoint?: string;
+  catalogue_id?: string;
+  /**
+   * `false` for a server registered from an arbitrary URL rather than from
+   * Caged's reviewed catalogue. The word also reaches the agent's model in the
+   * tool framing, so it is not cosmetic.
+   */
+  verified: boolean;
+  /** WHICH kind of credential is stored, never the value. */
+  auth_kind: MCPAuthKind | string;
+  protocol_era?: string;
+  protocol_version?: string;
+  status: MCPServerStatus | string;
+  quarantine_reason?: string;
+  /**
+   * Set on an `oauth` registration that is not authorized yet. It names the
+   * flow, so a registered-but-silent server is not a mystery.
+   */
+  oauth_next_step?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * One pinned catalogue entry.
+ *
+ * Named `MCPServerTool` rather than `MCPTool` because `MCPTool` already means
+ * "a tool on the agent's own MCP connection" in this package. They are
+ * different things and a shared name would make the wrong one importable.
+ */
+export interface MCPServerTool {
+  /** The UPSTREAM name. */
+  name: string;
+  /** What an agent calls and what a policy rule matches: `alias__tool`. */
+  namespaced_name: string;
+  description?: string;
+  state: MCPToolState | string;
+  flags?: string[];
+  /** Named an estimate because it is one: a measured character heuristic. */
+  definition_tokens_estimate: number;
+  first_seen_at?: string;
+  last_seen_at?: string;
+  approved_at?: string | null;
+}
+
+/** A registration plus its pinned tool catalogue. */
+export interface MCPServerDetail extends MCPServer {
+  tools: MCPServerTool[];
+}
+
+/**
+ * What a subject may SEE.
+ *
+ * A binding is not authorization. It decides what is advertised; whether a call
+ * is permitted is a policy decision on the namespaced name, per call. See
+ * {@link MCPPolicyAdvice}.
+ */
+export interface MCPBinding {
+  id: string;
+  server_id: string;
+  subject_kind: string;
+  subject_id?: string;
+  tool_allowlist: string[];
+  tool_denylist: string[];
+  pinned: boolean;
+  enabled: boolean;
+  argument_ceiling_bytes?: number;
+  created_at: string;
+}
+
+/** Which policy and rule decided, and whether anybody can edit it. */
+export interface MCPPolicyDecider {
+  layer?: string;
+  policy_id?: string;
+  policy_name?: string;
+  rule_id?: string;
+  by_default?: boolean;
+  /**
+   * `false` for an autonomy-tier template, which is code rather than data.
+   * A client must not send a reader to a policy editor that cannot reach it.
+   */
+  editable: boolean;
+}
+
+/**
+ * Whether policy will actually allow a bound server's tools.
+ *
+ * Read this when brokered calls are being refused. Caged's autonomy-tier table
+ * classifies its OWN tool names, so a third-party name like `github__get_issue`
+ * is unclassified — and an unclassified tool is denied at **every** tier,
+ * including `autonomous`.
+ *
+ * That default is deliberate: Caged cannot know whether a stranger's tool reads
+ * an issue or wires money. `client.mcp.allow()` writes the one rule that clears
+ * it; {@link mcpNeedsAllowRule} is the predicate to branch on.
+ */
+export interface MCPPolicyAdvice {
+  server_id: string;
+  alias: string;
+  persona_id?: string;
+  status: MCPPolicyStatus | string;
+  tools_evaluated: number;
+  tools_allowed: number;
+  tools_paused: number;
+  tools_denied: number;
+  /**
+   * An action token — `allow_mcp_server`, `edit_policy`,
+   * `change_autonomy_tier`, `contact_support` — or absent when nothing needs
+   * doing.
+   */
+  remedy?: string;
+  rule_id?: string;
+  tool_pattern?: string;
+  granted_rule_exists: boolean;
+  explanation: string;
+  allow_endpoint?: string;
+  decided_by?: MCPPolicyDecider;
+}
+
+/** What writing the policy allow rule did. */
+export interface MCPGrantResult {
+  policy_id: string;
+  rule_id: string;
+  /**
+   * `true` when the persona had no stored policy and Caged created one as an
+   * exact copy of its tier template plus this rule. Surfaced because "Caged
+   * created a policy for this persona" is a fact to learn now, not later.
+   */
+  policy_created: boolean;
+  tier_template_id?: string;
+  tool_pattern: string;
+  /** `true` when the rule was already there and nothing changed. */
+  already_present: boolean;
+}
+
+/**
+ * A created binding plus what still has to happen.
+ *
+ * `policy_advice` is why this type exists rather than returning a bare
+ * {@link MCPBinding}: an operator who binds a server and is not told that its
+ * tools are still denied discovers it one refused call at a time.
+ */
+export interface MCPBindResult extends MCPBinding {
+  policy_advice?: MCPPolicyAdvice;
+  policy_rule_written?: MCPGrantResult;
+  /**
+   * Caged's own sentence when an `allowTools` request could not be honoured.
+   * The binding still exists, so this arrives on a success rather than turning
+   * the whole call into a failure that leaves you unsure which half happened.
+   */
+  policy_rule_error?: string;
+}
+
+/**
+ * What one catalogue refresh did.
+ *
+ * `quarantined` is the one to act on: a definition whose digest differs from
+ * the stored one is held, not merged, and its tool is advertised to no agent
+ * until a human decides.
+ */
+export interface MCPRefreshReport {
+  server_id: string;
+  alias: string;
+  protocol_era?: string;
+  protocol_version?: string;
+  added: string[];
+  unchanged: string[];
+  changed: string[];
+  withdrawn: string[];
+  quarantined: string[];
+}
+
+/** One server Caged has reviewed. Registering from here is VERIFIED. */
+export interface MCPCatalogueEntry {
+  id: string;
+  display_name: string;
+  description?: string;
+  endpoint?: string;
+  transport: string;
+  auth_kind: string;
+  default_alias?: string;
+}
+
+/** One definition a server has advertised, and the decision about it. */
+export interface MCPToolRevision {
+  description: string;
+  input_schema?: Record<string, unknown>;
+  flags?: string[];
+  decision: "pending" | "approved" | "rejected" | string;
+  note?: string;
+  first_seen_at?: string;
+  last_seen_at?: string;
+  definition_tokens_estimate?: number;
+}
+
+/**
+ * What changed between the approved definition and the current one.
+ *
+ * `approved` is absent when nothing has ever been approved: a first sighting
+ * has nothing to compare against, and `explanation` says so rather than reading
+ * as "nothing changed".
+ *
+ * `added_properties` is the one to read first. A new parameter on an existing
+ * tool is how a tool acquires a field an agent can be talked into filling with
+ * a secret.
+ */
+export interface MCPToolDiff {
+  alias: string;
+  tool_name: string;
+  namespaced_name: string;
+  state: string;
+  approved?: MCPToolRevision;
+  current?: MCPToolRevision;
+  changed: string[];
+  added_properties: string[];
+  removed_properties: string[];
+  approved_digest?: string;
+  current_digest?: string;
+  explanation: string;
+  approve_endpoint?: string;
+  reject_endpoint?: string;
+}
+
+/**
+ * What is currently authorized. There is no field for a token.
+ *
+ * Caged holds the token itself: sealed at rest, never written into a sandbox,
+ * never in an environment variable, and never returned by any read.
+ */
+export interface MCPOAuthStatus {
+  server_id: string;
+  authorized: boolean;
+  issuer?: string;
+  scopes?: string[];
+  expires_at?: string;
+  has_refresh_token: boolean;
+  obtained_at?: string;
+  /** Reported rather than hidden: calls start failing when this is true. */
+  expired: boolean;
+}
+
+/**
+ * One recorded human decision.
+ *
+ * `persona_id` absent is an ACCOUNT-wide consent, which is a real and different
+ * decision from a per-persona one. A persona's own consent outranks the
+ * account-wide one.
+ */
+export interface MCPOAuthConsent {
+  id: string;
+  account_id?: string;
+  persona_id?: string;
+  server_id: string;
+  issuer: string;
+  scopes: string[];
+  granted_by?: string;
+  granted_at: string;
+  revoked_at?: string | null;
+}
+
+/**
+ * What authorizing would involve — the consent screen's contents.
+ *
+ * Nothing is minted or stored to produce this. It is the READ that comes before
+ * the decision, which is the order the confused-deputy mitigation depends on.
+ */
+export interface MCPOAuthProspect {
+  server_id: string;
+  alias: string;
+  issuer: string;
+  authorization_endpoint: string;
+  token_endpoint: string;
+  resource_name?: string;
+  resource: string;
+  scopes: string[];
+  client_id_metadata_document_supported: boolean;
+  /**
+   * Caged's own sentence for the screen: what is about to happen, in the order
+   * it happens. Show it to the human. Recording a consent from a discovered
+   * value nobody read is not a consent.
+   */
+  consent_statement: string;
+}
+
+/** The OAuth surface for one server: status, consents, and the prospect. */
+export interface MCPOAuthState {
+  status: MCPOAuthStatus;
+  consents: MCPOAuthConsent[];
+  prospect?: MCPOAuthProspect;
+  /**
+   * Set when discovery failed. Reported alongside a real `status` rather than
+   * replacing it: what is authorized is still true when a third party's
+   * metadata endpoint is down.
+   */
+  discovery_error?: string;
+}
+
+/** The URL to open, and how long it is live for. */
+export interface MCPOAuthAuthorization {
+  authorization_url: string;
+  expires_in_seconds: number;
+  note?: string;
+}
+
+/** One question a third-party server asked, sanitised by the API. */
+export interface MCPInputQuestion {
+  id?: string;
+  /**
+   * From a closed set: `elicitation`, `roots`, `url`, `unknown`. An
+   * unrecognised upstream kind arrives as `unknown` rather than being defaulted
+   * to `elicitation`.
+   */
+  kind: string;
+  message: string;
+  /** The requested JSON Schema, for rendering a form. */
+  schema?: Record<string, unknown>;
+}
+
+/**
+ * A question set waiting on a person.
+ *
+ * The call it belongs to has already returned to the agent with "a human has
+ * been asked, retry later". Answering this makes the agent's next attempt at the
+ * same call complete; Caged does not re-send the call itself, because a tool
+ * call whose side effect may be half-done must not be repeated by
+ * infrastructure.
+ */
+export interface MCPInputRequest {
+  id: string;
+  sandbox_id: string;
+  server_id?: string;
+  alias: string;
+  /** The namespaced name the agent used. */
+  tool: string;
+  round: number;
+  round_limit: number;
+  state: string;
+  questions: MCPInputQuestion[];
+  approval_id?: string;
+  created_at: string;
+  expires_at: string;
+}
+
+/** Register a third-party MCP server. */
+export interface MCPServerCreateParams {
+  /** Register from Caged's reviewed catalogue. Mutually useful with `endpoint`. */
+  catalogueId?: string;
+  alias?: string;
+  endpoint?: string;
+  displayName?: string;
+  description?: string;
+  authKind?: MCPAuthKind | string;
+  /** Sealed by the API immediately; never returned by any read. */
+  credential?: string;
+  headers?: Record<string, string>;
+}
+
+/** Bind a server to a subject. */
+export interface MCPBindParams {
+  /** Omit for an account-wide binding, which every persona sees. */
+  personaId?: string;
+  /** Upstream tool names. Empty means every approved tool on the server. */
+  tools?: string[];
+  deny?: string[];
+  /** Never defer these tools behind the projection token budget. */
+  pinned?: boolean;
+  argumentCeilingBytes?: number;
+  /**
+   * Also write the policy rule that makes these tools callable.
+   *
+   * Defaults to `false` on purpose: binding a server and granting its tools are
+   * two decisions, and folding them together by default would make "I bound it
+   * to look at its catalogue" mean "I allowed it". What was wrong before was
+   * not that the grant was separate — it was that it was invisible, which is
+   * why {@link MCPBindResult} always carries the advice.
+   */
+  allowTools?: boolean;
+}
+
+/**
+ * Whether one `allow` call would make a bound server's tools callable.
+ *
+ * A function rather than a field, because the API's response is data and a
+ * derived boolean on it would be a second place for the rule to live.
+ */
+export function mcpNeedsAllowRule(advice: MCPPolicyAdvice): boolean {
+  return advice.remedy === "allow_mcp_server" && !advice.granted_rule_exists;
+}

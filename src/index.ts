@@ -13,7 +13,7 @@ export type {
   MCPPrompt,
   MCPPromptResult,
 } from "./mcp";
-export { CLEAR_CREDENTIAL, EVENT_TYPES } from "./types";
+export { CLEAR_CREDENTIAL, EVENT_TYPES, mcpNeedsAllowRule } from "./types";
 export type {
   Account,
   AccountSession,
@@ -36,6 +36,34 @@ export type {
   GitFileStatus,
   IngestResponse,
   LogEntry,
+  // Third-party MCP servers (client.mcp.*). MCPServerTool is deliberately not
+  // MCPTool: that name already means "a tool on the agent's own MCP
+  // connection" and is exported from ./mcp above.
+  MCPAuthKind,
+  MCPBinding,
+  MCPBindParams,
+  MCPBindResult,
+  MCPCatalogueEntry,
+  MCPGrantResult,
+  MCPInputQuestion,
+  MCPInputRequest,
+  MCPOAuthAuthorization,
+  MCPOAuthConsent,
+  MCPOAuthProspect,
+  MCPOAuthState,
+  MCPOAuthStatus,
+  MCPPolicyAdvice,
+  MCPPolicyDecider,
+  MCPPolicyStatus,
+  MCPRefreshReport,
+  MCPServer,
+  MCPServerCreateParams,
+  MCPServerDetail,
+  MCPServerStatus,
+  MCPServerTool,
+  MCPToolDiff,
+  MCPToolRevision,
+  MCPToolState,
   Notification,
   NotificationConfig,
   NotificationConfigUpdate,
