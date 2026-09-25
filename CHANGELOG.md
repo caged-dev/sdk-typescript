@@ -2,6 +2,51 @@
 
 All notable changes to `@caged-dev/sdk`.
 
+## Unreleased
+
+### Added — `client.mcp.*`, third-party MCP servers
+
+The MCP section that already existed is the MCP server Caged *is*. This is
+about the servers Caged *uses*: an agent in a sandbox reaching GitHub, Linear
+or Postgres through Caged's broker, without the sandbox's egress widening by
+one byte.
+
+- `client.mcp.servers` — `add`, `list`, `get`, `refresh`, `remove`
+- `client.mcp.bind` / `unbind` / `bindings` — who sees which server
+- `client.mcp.tools`, `toolDiff`, `toolRevisions`, `approveTool`, `rejectTool`
+  — the pinned catalogue and the rug-pull review
+- `client.mcp.readiness`, `advice`, `allow`, `disallow` — whether policy will
+  actually allow those tools, and the one rule that makes it
+- `client.mcp.oauth` — `show`, `consent`, `authorize`, `forget`,
+  `revokeConsent`
+- `client.mcp.inputs` — `list`, `get`, `respond`: questions servers asked,
+  waiting on a person
+- `client.mcp.catalogue` — the servers Caged has reviewed
+- `mcpNeedsAllowRule(advice)` — the predicate for "one `allow` call away"
+
+Two of the new types exist because the API's happy path does not tell you what
+you need to know, and a client returning only the happy path leaves you to find
+out the expensive way:
+
+- **`MCPPolicyAdvice`**, returned on every `bind` and by `readiness()`. A
+  brokered tool name matches nothing in Caged's autonomy-tier table, so a bound
+  external tool is denied at every tier — including `autonomous` — until a rule
+  allows it.
+- **`MCPToolDiff`**, which carries the definition a human approved beside the
+  one the server is advertising now, with added and removed parameters named.
+  Approving a change without reading it is the outcome digest pinning exists to
+  prevent.
+
+No type in this release has a field for a credential or a token, and a test
+asserts it. `MCPServerTool` is named that rather than `MCPTool` because
+`MCPTool` already means "a tool on the agent's own MCP connection" in this
+package, and a shared name would make the wrong one importable.
+
+`allow()` throws without a `personaId`, with the reason: Caged's account policy
+layer is restriction-only, so a rule written there would be stored, displayed,
+and have no effect whatsoever.
+
+
 ## 0.3.0 — unreleased
 
 The 0.1.0 client was written against a description of the API rather than
